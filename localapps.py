@@ -10,9 +10,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import termios
 import time
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 REFRESH_SECONDS = 2.0
 INPUT_TIMEOUT_MS = 200
@@ -36,7 +37,10 @@ HOME = os.path.expanduser("~")
 
 LOG_DIR = os.path.expanduser("~/Library/Logs/localapps")
 LOG_TAIL_BYTES = 256 * 1024
-ANSI_ESCAPE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|[@-Z\\-_])")
+WRAPPER_LOG_NAME = re.compile(r"^(\d+)\.log$")
+ANSI_ESCAPE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+# Caracteres de control C0 y C1 (categoría Unicode Cc); incluye C1 como \x9b, que ANSI_ESCAPE no quita.
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 LSOF_LISTEN = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]
 LIST_FOOTER = " ↑↓ mover · clic/⏎ logs · o abrir en navegador · x matar · s mostrar ocultas · r refrescar · q salir "
@@ -210,8 +214,25 @@ def parse_log_candidates(lsof_output: str) -> List[str]:
     return list(dict.fromkeys(redirected + log_files))
 
 
+def orphan_log_names(file_names: List[str], is_alive: Callable[[int], bool]) -> List[str]:
+    """Logs de `localapps run` (`<pid>.log`) cuyo envoltorio ya no existe; ignora cualquier otro fichero."""
+    orphans = []
+    for name in file_names:
+        match = WRAPPER_LOG_NAME.match(name)
+        if match and not is_alive(int(match.group(1))):
+            orphans.append(name)
+    return orphans
+
+
+def parse_pids(lsof_output: str) -> Set[int]:
+    """Parsea `lsof -t`: un PID por línea."""
+    return {int(line) for line in lsof_output.split() if line.isdigit()}
+
+
 def clean_log_line(line: str) -> str:
-    return ANSI_ESCAPE.sub("", line).replace("\r", "").replace("\t", "    ")
+    """Quita secuencias ANSI y caracteres de control; los tabuladores pasan a 4 espacios."""
+    text = ANSI_ESCAPE.sub("", line).replace("\t", "    ")
+    return CONTROL_CHARS.sub("", text)
 
 
 def log_window(lines: List[str], height: int, scroll: int) -> Tuple[List[str], int]:
@@ -244,6 +265,20 @@ def collect_apps() -> List[App]:
     return build_apps(ports_by_pid, names_by_pid, cwd_by_pid, info_by_pid)
 
 
+def process_start_time(pid: int) -> str:
+    """Hora de arranque del proceso; cadena vacía si ya no existe."""
+    return run_command(["ps", "-o", "lstart=", "-p", str(pid)]).strip()
+
+
+def is_same_process(expected: App, current: Optional[App]) -> bool:
+    """Mismo ejecutable y mismos puertos; la hora de arranque se comprueba aparte (`confirm_kill`)."""
+    return (
+        current is not None
+        and current.executable == expected.executable
+        and current.ports == expected.ports
+    )
+
+
 def terminate(app: App) -> str:
     try:
         os.kill(app.pid, signal.SIGTERM)
@@ -268,8 +303,10 @@ def find_log_file(app: App) -> Optional[str]:
     """Busca el log de una app: el de `localapps run` de algún ancestro, o un fichero que tenga abierto."""
     parent_by_pid = parse_parents(run_command(["ps", "-A", "-o", "pid=,ppid="]))
     for pid in ancestors(app.pid, parent_by_pid):
-        if os.path.isfile(wrapper_log_path(pid)):
-            return wrapper_log_path(pid)
+        path = wrapper_log_path(pid)
+        # Solo vale si el envoltorio lo tiene abierto: si no, es un log viejo de un PID reutilizado.
+        if os.path.isfile(path) and pid in parse_pids(run_command(["lsof", "-t", path])):
+            return path
     candidates = parse_log_candidates(run_command(["lsof", "-a", "-nP", "-p", str(app.pid), "-Fftn"]))
     return candidates[0] if candidates else None
 
@@ -288,15 +325,48 @@ def read_log_lines(path: str) -> List[str]:
     return [clean_log_line(line) for line in lines]
 
 
+def is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # Existe, aunque sea de otro usuario.
+    return True
+
+
+def remove_orphan_logs() -> None:
+    """Borra los logs que dejó un `localapps run` que murió sin limpiar (p. ej. con SIGKILL)."""
+    for name in orphan_log_names(os.listdir(LOG_DIR), is_process_alive):
+        try:
+            os.unlink(os.path.join(LOG_DIR, name))
+        except FileNotFoundError:
+            pass
+
+
+def exit_on_signal(signum: int, frame: object) -> None:
+    raise SystemExit(128 + signum)
+
+
 def run_with_log(command: List[str]) -> int:
     """Ejecuta el comando en una pseudo-terminal (conserva colores y Ctrl+C) y copia su salida al log."""
     if shutil.which(command[0]) is None:
         print("localapps: no se encuentra el comando '{}'".format(command[0]), file=sys.stderr)
         return 127
     os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+    remove_orphan_logs()
     path = wrapper_log_path(os.getpid())
-    # Los logs pueden contener datos sensibles (tokens, datos de usuarios): solo los lee el propietario.
-    log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.unlink(path)  # Un log con nuestro PID es de un proceso anterior que reutilizó el PID.
+    except FileNotFoundError:
+        pass
+    try:
+        # Los logs pueden contener datos sensibles (tokens, datos de usuarios): solo los lee el propietario.
+        # O_EXCL|O_NOFOLLOW: no seguir un enlace plantado ni reutilizar un fichero ajeno.
+        log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        print("localapps: no se puede crear el log {}: {}".format(path, error.strerror), file=sys.stderr)
+        return 1
     print("localapps: guardando logs en {}".format(shorten_home(path)), file=sys.stderr)
 
     def copy_to_log(master_fd: int) -> bytes:
@@ -308,11 +378,31 @@ def run_with_log(command: List[str]) -> int:
         os.write(log_fd, data)
         return data
 
+    # pty.spawn pone la terminal en modo raw y solo la restaura si termina por OSError.
+    stdin_fd = pty.STDIN_FILENO
+    tty_mode = termios.tcgetattr(stdin_fd) if os.isatty(stdin_fd) else None
+    # Python deja SIGHUP/SIGTERM en SIG_DFL y el proceso moriría sin ejecutar el `finally`.
+    # Al salir se cierra el maestro del pty y el comando recibe SIGHUP.
+    previous_handlers = {signum: signal.signal(signum, exit_on_signal) for signum in (signal.SIGHUP, signal.SIGTERM)}
     try:
         status = pty.spawn(command, copy_to_log)
     finally:
-        os.close(log_fd)
-        os.remove(path)
+        try:
+            os.close(log_fd)
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            finally:
+                try:
+                    if tty_mode is not None:
+                        termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, tty_mode)
+                except (termios.error, OSError):
+                    pass  # Con la pestaña cerrada la TTY ya no existe (EIO).
+                finally:
+                    for signum, handler in previous_handlers.items():
+                        signal.signal(signum, handler)
     return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
 
 
@@ -343,6 +433,7 @@ class LocalAppsTui:
         self.selected_pid: Optional[int] = None
         self.show_hidden = False
         self.pending_kill: Optional[App] = None
+        self.pending_kill_started = ""
         self.log_view: Optional[LogView] = None
         self.list_offset = 0
         self.message = ""
@@ -384,6 +475,7 @@ class LocalAppsTui:
 
     def open_logs(self, app: App) -> None:
         self.log_view = LogView(app=app, path=find_log_file(app))
+        self.pending_kill = None
         self.message = ""
 
     def log_page_height(self) -> int:
@@ -395,6 +487,9 @@ class LocalAppsTui:
     def handle_key(self, key: int) -> bool:
         """Procesa una tecla o evento de ratón; devuelve False para salir."""
         if key == curses.KEY_MOUSE:
+            if self.pending_kill is not None:
+                self.pending_kill = None
+                self.message = "Cancelado"
             self.handle_mouse()
             return True
         if self.log_view is not None:
@@ -438,14 +533,26 @@ class LocalAppsTui:
         elif key == ord("G"):
             view.scroll = 0
 
+    def confirm_kill(self, expected: App, started: str) -> None:
+        """Mata solo si el PID sigue siendo el mismo proceso que se confirmó."""
+        self.refresh_apps()
+        current = next((a for a in self.apps if a.pid == expected.pid), None)
+        now_started = process_start_time(expected.pid)
+        if is_same_process(expected, current) and now_started and now_started == started:
+            self.message = terminate(expected)
+        else:
+            self.message = "{} (PID {}) ha cambiado o ya no existe; no se ha matado".format(
+                expected.name, expected.pid)
+
     def handle_list_key(self, key: int) -> bool:
         if self.pending_kill is not None:
             if key in (ord("y"), ord("Y")):
-                self.message = terminate(self.pending_kill)
+                self.confirm_kill(self.pending_kill, self.pending_kill_started)
                 self.last_refresh = 0.0
             else:
                 self.message = "Cancelado"
             self.pending_kill = None
+            self.pending_kill_started = ""
             return True
 
         app = self.selected_app()
@@ -465,6 +572,7 @@ class LocalAppsTui:
             self.message = open_in_browser(app)
         elif key == ord("x") and app:
             self.pending_kill = app
+            self.pending_kill_started = process_start_time(app.pid)
             self.message = "¿Matar {} (PID {})? [y/N]".format(app.name, app.pid)
         return True
 
@@ -486,7 +594,7 @@ class LocalAppsTui:
         title = " localapps · {} apps · {}{} ".format(
             len(rows),
             time.strftime("%H:%M:%S"),
-            " · {} ocultas (sistema/herramientas)".format(hidden) if hidden else "",
+            " · {} ocultas (sistema/herramientas/IA)".format(hidden) if hidden else "",
         )
         self.write(0, title.ljust(width), width, curses.A_REVERSE | curses.A_BOLD)
         self.write(2, "{:>7}  {:<18} {:<22} {:>12}  {}".format("PID", "PUERTOS", "APP", "TIEMPO", "PROYECTO"),
@@ -544,8 +652,8 @@ class LocalAppsTui:
         if 0 <= y < height:
             try:
                 self.screen.addnstr(y, 0, text, width - 1, attr)
-            except curses.error:
-                pass  # La terminal se ha redimensionado durante el pintado; se repinta en el siguiente ciclo.
+            except (curses.error, ValueError):
+                pass  # Terminal redimensionada durante el pintado o texto con caracteres que curses rechaza; se repinta en el siguiente ciclo.
 
 
 USAGE = """uso:
