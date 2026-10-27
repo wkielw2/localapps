@@ -1,0 +1,6 @@
+name: Apps corriendo en local (TUI)
+command: localapps
+description: Vista en tiempo real de las apps escuchando en puertos TCP locales; permite abrirlas en el navegador o matarlas.
+tags:
+  - dev
+  - ports
