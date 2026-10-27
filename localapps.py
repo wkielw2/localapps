@@ -37,8 +37,12 @@ HOME = os.path.expanduser("~")
 
 LOG_DIR = os.path.expanduser("~/Library/Logs/localapps")
 LOG_TAIL_BYTES = 256 * 1024
-WRAPPER_LOG_NAME = re.compile(r"^(\d+)\.log$")
-ANSI_ESCAPE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+WRAPPER_LOG_NAME = re.compile(r"([0-9]+)\.log", re.ASCII)
+# Mayor valor de pid_t: por encima, os.kill lanza OverflowError.
+MAX_PID = 2**31 - 1
+# CSI (con parámetros privados y ':'); OSC/PM/APC/SOS terminadas en BEL o ST sin cruzar líneas;
+# DCS terminada en BEL o ST, multilínea pero acotada a 4096 caracteres; nF; Fp/Fe/Fs.
+ANSI_ESCAPE = re.compile(r"\x1b(\[[0-?]*[ -/]*[@-~]|[\]^_X][^\x07\x1b\n]*(?:\x07|\x1b\\)|P[^\x07\x1b]{0,4096}(?:\x07|\x1b\\)|[ -/]+[0-~]|[0-~])")
 # Caracteres de control C0 y C1 (categoría Unicode Cc); incluye C1 como \x9b, que ANSI_ESCAPE no quita.
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
@@ -215,11 +219,15 @@ def parse_log_candidates(lsof_output: str) -> List[str]:
 
 
 def orphan_log_names(file_names: List[str], is_alive: Callable[[int], bool]) -> List[str]:
-    """Logs de `localapps run` (`<pid>.log`) cuyo envoltorio ya no existe; ignora cualquier otro fichero."""
+    """Logs de `localapps run` (`<pid>.log`) cuyo envoltorio ya no existe; ignora cualquier otro fichero
+    y los nombres con un PID imposible (0 o fuera del rango de pid_t)."""
     orphans = []
     for name in file_names:
-        match = WRAPPER_LOG_NAME.match(name)
-        if match and not is_alive(int(match.group(1))):
+        match = WRAPPER_LOG_NAME.fullmatch(name)
+        if not match:
+            continue
+        pid = int(match.group(1))
+        if 0 < pid <= MAX_PID and not is_alive(pid):
             orphans.append(name)
     return orphans
 
@@ -230,7 +238,10 @@ def parse_pids(lsof_output: str) -> Set[int]:
 
 
 def clean_log_line(line: str) -> str:
-    """Quita secuencias ANSI y caracteres de control; los tabuladores pasan a 4 espacios."""
+    """Quita secuencias ANSI completas y caracteres de control; los tabuladores pasan a 4 espacios.
+
+    Una secuencia truncada no casa con ANSI_ESCAPE: se elimina su ESC (control) pero su resto queda como texto.
+    """
     text = ANSI_ESCAPE.sub("", line).replace("\t", "    ")
     return CONTROL_CHARS.sub("", text)
 
@@ -319,7 +330,8 @@ def read_log_lines(path: str) -> List[str]:
             text = log.read().decode("utf-8", errors="replace")
     except OSError as error:
         return ["No se puede leer {}: {}".format(path, error.strerror)]
-    lines = text.splitlines()
+    # Limpiar el bloque entero: una secuencia (p. ej. DCS) puede cruzar saltos de línea.
+    lines = ANSI_ESCAPE.sub("", text).splitlines()
     if size > LOG_TAIL_BYTES:
         lines = lines[1:]  # La primera línea del bloque leído suele estar cortada.
     return [clean_log_line(line) for line in lines]
@@ -340,8 +352,8 @@ def remove_orphan_logs() -> None:
     for name in orphan_log_names(os.listdir(LOG_DIR), is_process_alive):
         try:
             os.unlink(os.path.join(LOG_DIR, name))
-        except FileNotFoundError:
-            pass
+        except OSError:
+            pass  # Ya borrado, sin permiso o no es un fichero: lo que no se pueda borrar se deja.
 
 
 def exit_on_signal(signum: int, frame: object) -> None:
@@ -381,9 +393,14 @@ def run_with_log(command: List[str]) -> int:
     # pty.spawn pone la terminal en modo raw y solo la restaura si termina por OSError.
     stdin_fd = pty.STDIN_FILENO
     tty_mode = termios.tcgetattr(stdin_fd) if os.isatty(stdin_fd) else None
-    # Python deja SIGHUP/SIGTERM en SIG_DFL y el proceso moriría sin ejecutar el `finally`.
-    # Al salir se cierra el maestro del pty y el comando recibe SIGHUP.
-    previous_handlers = {signum: signal.signal(signum, exit_on_signal) for signum in (signal.SIGHUP, signal.SIGTERM)}
+    # Con SIGHUP/SIGTERM en SIG_DFL el proceso moriría sin ejecutar el `finally`, así que se capturan.
+    # Si llegan ignorados (p. ej. `nohup`) se respetan: `exec` conserva SIG_IGN, pero devuelve a SIG_DFL
+    # las capturadas. Al salir por la señal se cierra el maestro del pty y el comando recibe SIGHUP.
+    previous_handlers = {
+        signum: signal.signal(signum, exit_on_signal)
+        for signum in (signal.SIGHUP, signal.SIGTERM)
+        if signal.getsignal(signum) is signal.SIG_DFL
+    }
     try:
         status = pty.spawn(command, copy_to_log)
     finally:

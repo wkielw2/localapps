@@ -2,7 +2,7 @@
 # Instala localapps: enlaza el script en ~/.local/bin (o LOCALAPPS_BIN_DIR) y añade el workflow de Warp.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BIN_DIR="${LOCALAPPS_BIN_DIR:-$HOME/.local/bin}"
 WARP_WORKFLOWS_DIR="$HOME/.warp/workflows"
 TARGET="$REPO_DIR/localapps.py"
@@ -19,8 +19,10 @@ command -v python3 >/dev/null || fail "hace falta python3 (3.7 o superior)."
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 7))' || fail "hace falta Python 3.7 o superior."
 
 # No se pisa nada ajeno: solo se continúa si no existe o ya es el enlace a este repo.
+# Se compara con -ef (mismo dispositivo e inodo) y no por texto: el repo puede alcanzarse
+# por rutas con enlaces simbólicos. Un enlace roto da falso y se trata como ajeno.
 if [[ -e "$LINK" || -L "$LINK" ]]; then
-  if [[ ! -L "$LINK" || "$(readlink "$LINK")" != "$TARGET" ]]; then
+  if ! [[ -L "$LINK" && "$LINK" -ef "$TARGET" ]]; then
     fail "ya existe $LINK y no es un enlace a este repo; bórralo tú o instala en otra carpeta con LOCALAPPS_BIN_DIR."
   fi
 fi

@@ -22,6 +22,8 @@ cd ~/Documents/Proyectos/localapps
 - Aborta si `~/.local/bin/localapps` ya existe y no es un enlace a este repo. Bórralo o usa otra carpeta con `LOCALAPPS_BIN_DIR`.
 - Si `~/.warp/workflows/localapps.yaml` ya existe y difiere del del repo, o es un enlace simbólico, lo conserva y avisa. Para actualizarlo, bórralo y vuelve a ejecutar `./install.sh`. Volver a ejecutarlo es seguro.
 
+`install.sh` y `uninstall.sh` reconocen el repo aunque se lancen por otra ruta que llegue a él mediante enlaces simbólicos; un enlace roto se trata como ajeno.
+
 Para desinstalar: `./uninstall.sh`. Solo borra el enlace si apunta a este repo, y el workflow solo si es idéntico al del repo; si lo has modificado, lo conserva y avisa. Si instalaste con `LOCALAPPS_BIN_DIR`, desinstala con la misma variable: `LOCALAPPS_BIN_DIR=/ruta ./uninstall.sh`.
 
 ## Ver los logs de una app
@@ -35,11 +37,11 @@ cd ~/proyectos/mi-api
 localapps run -- dotnet watch --project Api
 ```
 
-`localapps run` ejecuta el comando en una pseudo-terminal (se conservan los colores y `Ctrl+C`) y copia la salida en `~/Library/Logs/localapps/<pid>.log` (permisos `600`). El fichero se borra cuando el comando termina, también si cierras la pestaña (SIGHUP) o si recibe SIGTERM; en ambos casos el comando lanzado recibe SIGHUP y termina. Si el envoltorio muere con SIGKILL, el log huérfano se borra en el siguiente `localapps run`. La TUI encuentra el log aunque la app que escucha sea un proceso hijo del comando, como ocurre con `dotnet watch`.
+`localapps run` ejecuta el comando en una pseudo-terminal (se conservan los colores y `Ctrl+C`) y copia la salida en `~/Library/Logs/localapps/<pid>.log` (permisos `600`). El fichero se borra cuando el comando termina, también si cierras la pestaña (SIGHUP) o si recibe SIGTERM; en ambos casos el comando lanzado recibe SIGHUP (termina salvo que lo capture o lo ignore). Si se lanza con SIGHUP ignorado (p. ej. `nohup localapps run -- …`), se respeta: el envoltorio no lo captura y el comando también lo ignora, así que no termina al cerrar la pestaña. Si el envoltorio muere con SIGKILL, el log huérfano se borra en el siguiente `localapps run`. La TUI encuentra el log aunque la app que escucha sea un proceso hijo del comando, como ocurre con `dotnet watch`.
 
 Sin `localapps run`, también se muestran los logs de apps que redirigen su salida a un fichero (`> app.log`) o que tienen abierto un fichero `.log`.
 
-La vista de logs elimina secuencias de escape y caracteres de control, y no se cae si el log contiene bytes nulos.
+La vista de logs elimina las secuencias de escape completas (las de cadena DCS pueden ocupar varias líneas; OSC, APC, PM y SOS no cruzan saltos de línea) y los caracteres de control, y no se cae si el log contiene bytes nulos. Una secuencia truncada (p. ej. al leer un log a mitad de escritura, o cortada por el límite de lectura de los últimos 256 KiB) no se reconoce: se quita el carácter ESC pero pueden quedar restos visibles, como sus parámetros (p. ej. `31`); desaparecen en el siguiente repintado si la secuencia ya se ha completado.
 
 En Warp, el clic y la rueda necesitan la opción *Enable Mouse Reporting* de los ajustes activada.
 
@@ -52,7 +54,7 @@ En Warp, el clic y la rueda necesitan la opción *Enable Mouse Reporting* de los
 | `↑` `↓` / `k` `j` | Mover la selección |
 | Clic / `Enter` / `l` | Abrir los logs de la app |
 | `o` | Abrir `http://localhost:<primer puerto>` en el navegador |
-| `x` | Matar el proceso (SIGTERM, pide confirmación `y`). Antes comprueba que el PID sigue siendo la misma app (mismo ejecutable, puertos y hora de arranque); si ha cambiado, no la mata y avisa. Un clic durante la confirmación la cancela |
+| `x` | Matar el proceso (SIGTERM, pide confirmación `y`). Antes comprueba que el PID sigue siendo la misma app (mismo ejecutable, puertos y hora de arranque); si ha cambiado, no la mata y avisa. Cualquier evento de ratón (clic o rueda) durante la confirmación la cancela |
 | `s` | Mostrar u ocultar los procesos ocultos por defecto: sistema (`/System/`, `/usr/libexec/`, `/usr/sbin/`) y herramientas instaladas como `.app` (`/Applications/`, `~/Applications/`: Warp, VS Code, DBeaver...), CLIs de agentes de IA (Claude Code, Codex) y supervisores de desarrollo como `dotnet watch` |
 | `r` | Refrescar ya |
 | `q` / `Esc` | Salir |
@@ -71,5 +73,5 @@ Solo ve los procesos de tu usuario; los de otros usuarios o root no aparecen sin
 ## Tests
 
 ```bash
-python3 -m unittest -v test_localapps
+python3 -B -m unittest -v test_localapps
 ```

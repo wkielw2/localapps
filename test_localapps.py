@@ -240,6 +240,24 @@ class CleanLogLineTest(unittest.TestCase):
     def test_conserva_texto_unicode_imprimible(self):
         self.assertEqual(clean_log_line("ñandú € 😀"), "ñandú € 😀")
 
+    def test_quita_otras_secuencias_de_escape(self):
+        cases = {
+            "\x1b(B\x1b[mok": "ok",  # nF (selección de juego de caracteres)
+            "\x1b[38:2:255:0:0mrgb": "rgb",  # CSI con ':'
+            "\x1b[>4;2mok": "ok",  # CSI con parámetro privado
+            "\x1bPq#0\x1b\\ok": "ok",  # DCS terminada en ST
+            "\x1b7a\x1b8": "a",  # Fp
+            "\x1b=x": "x",
+            "[ok] \x1b[1m[ERR]\x1b[0m": "[ok] [ERR]",
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(clean_log_line(line), expected)
+
+    def test_quita_el_escape_suelto_o_con_introductor_al_final_del_texto(self):
+        self.assertEqual(clean_log_line("ok\x1b"), "ok")
+        self.assertEqual(clean_log_line("ok\x1b["), "ok")
+
 
 class WriteTest(unittest.TestCase):
     def test_no_lanza_si_curses_rechaza_el_texto(self):
@@ -273,6 +291,41 @@ class ReadLogLinesTest(unittest.TestCase):
 
         tail_starting_inside_first_line = len("a\nsegunda\ntercera\n")
         with mock.patch.object(localapps, "LOG_TAIL_BYTES", tail_starting_inside_first_line):
+            self.assertEqual(read_log_lines(log.name), ["segunda", "tercera"])
+
+    def test_quita_secuencias_de_escape_que_cruzan_lineas(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as log:
+            log.write("\x1bPq#0\n#1\x1b\\ok")
+        self.addCleanup(os.remove, log.name)
+
+        self.assertEqual(read_log_lines(log.name), ["ok"])
+
+    def _read(self, content):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as log:
+            log.write(content)
+        self.addCleanup(os.remove, log.name)
+        return read_log_lines(log.name)
+
+    def test_una_osc_sin_terminar_no_oculta_las_lineas_hasta_un_bel_posterior(self):
+        # La OSC no cruza saltos de línea: solo se quita "ESC ]"; el BEL final es un carácter de control.
+        self.assertEqual(self._read("\x1b]0;t\nlinea1\nlinea2\x07fin"), ["0;t", "linea1", "linea2fin"])
+
+    def test_una_apc_sin_terminar_no_oculta_las_lineas_hasta_un_bel_posterior(self):
+        self.assertEqual(self._read("a\x1b_x\nb\x07c"), ["ax", "bc"])
+
+    def test_una_dcs_mas_larga_que_el_limite_sin_terminador_no_oculta_las_lineas_siguientes(self):
+        lines = self._read("\x1bP" + "x" * 5000 + "\nvisible\x1b\\")
+
+        self.assertIn("visible", lines)
+
+    def test_descarta_la_linea_cortada_aunque_el_corte_caiga_dentro_de_una_secuencia_de_escape(self):
+        content = "\x1b[31mroja\x1b[0m\nsegunda\ntercera\n"
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as log:
+            log.write(content)
+        self.addCleanup(os.remove, log.name)
+
+        tail_starting_inside_escape = len(content) - content.index("1m")  # el bloque empieza en "1mroja..."
+        with mock.patch.object(localapps, "LOG_TAIL_BYTES", tail_starting_inside_escape):
             self.assertEqual(read_log_lines(log.name), ["segunda", "tercera"])
 
     def test_informa_si_el_fichero_no_existe(self):
@@ -309,7 +362,9 @@ class RunWithLogTest(unittest.TestCase):
         test_dir = os.path.dirname(os.path.abspath(__file__))
         for signal_name, expected_code in (("TERM", 143), ("HUP", 129)):
             with self.subTest(signal=signal_name):
-                script = ("import localapps, sys; localapps.LOG_DIR = {!r}; "
+                script = ("import localapps, signal, sys; "
+                          "signal.signal(signal.SIGHUP, signal.SIG_DFL); signal.signal(signal.SIGTERM, signal.SIG_DFL); "
+                          "localapps.LOG_DIR = {!r}; "
                           "sys.exit(localapps.run_with_log(['sh', '-c', 'kill -{} $PPID; sleep 1']))"
                           ).format(self.log_dir, signal_name)
 
@@ -319,6 +374,66 @@ class RunWithLogTest(unittest.TestCase):
 
                 self.assertEqual(result.returncode, expected_code)
                 self.assertEqual(os.listdir(self.log_dir), [])
+
+    def test_respeta_sighup_ignorado_y_el_comando_no_lo_hereda_como_muerte(self):
+        # Como con `nohup`: SIGHUP llega ignorado y el comando debe seguir vivo tras su propio `kill -HUP`.
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        script = ("import localapps, signal, sys; signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+                  "localapps.LOG_DIR = {!r}; "
+                  "sys.exit(localapps.run_with_log(['sh', '-c', 'kill -HUP $$; exit 7']))").format(self.log_dir)
+
+        result = subprocess.run([sys.executable, "-B", "-c", script], cwd=test_dir,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10)
+
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(os.listdir(self.log_dir), [])
+
+    def test_no_sustituye_una_senal_ignorada_y_si_la_que_esta_por_defecto(self):
+        self.addCleanup(signal.signal, signal.SIGHUP, signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.signal(signal.SIGTERM, signal.SIG_DFL))
+        during = []
+
+        def spawn_and_record(command, master_read):
+            during.append((signal.getsignal(signal.SIGHUP), signal.getsignal(signal.SIGTERM)))
+            return 0
+
+        with mock.patch("localapps.pty.spawn", side_effect=spawn_and_record), mock.patch("sys.stderr"):
+            run_with_log(["true"])
+
+        self.assertEqual(during, [(signal.SIG_IGN, localapps.exit_on_signal)])
+        self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_respeta_sigterm_ignorado_y_el_comando_no_lo_hereda_como_muerte(self):
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        script = ("import localapps, signal, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                  "localapps.LOG_DIR = {!r}; "
+                  "sys.exit(localapps.run_with_log(['sh', '-c', 'kill -TERM $$; exit 7']))").format(self.log_dir)
+
+        result = subprocess.run([sys.executable, "-B", "-c", script], cwd=test_dir,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10)
+
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(os.listdir(self.log_dir), [])
+
+    def test_no_sustituye_un_manejador_propio_durante_la_ejecucion(self):
+        def own_handler(signum, frame):
+            pass
+
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            self.addCleanup(signal.signal, signum, signal.signal(signum, own_handler))
+        during = []
+
+        def spawn_and_record(command, master_read):
+            during.append((signal.getsignal(signal.SIGHUP), signal.getsignal(signal.SIGTERM)))
+            return 0
+
+        with mock.patch("localapps.pty.spawn", side_effect=spawn_and_record), mock.patch("sys.stderr"):
+            run_with_log(["true"])
+
+        self.assertEqual(during, [(own_handler, own_handler)])
 
     def test_borra_al_arrancar_los_logs_de_envoltorios_muertos(self):
         for name in ("11111.log", "22222.log", "notas.txt"):
@@ -445,6 +560,25 @@ class OrphanLogNamesTest(unittest.TestCase):
 
         self.assertEqual(orphan_log_names(names, lambda pid: pid == 200), ["100.log"])
 
+    def test_no_acepta_digitos_no_ascii_ni_salto_de_linea_final(self):
+        self.assertEqual(orphan_log_names(["١٢.log", "12.log\n"], lambda pid: False), [])
+
+    def test_ignora_pids_fuera_de_rango_sin_consultar_si_estan_vivos(self):
+        is_alive = mock.Mock(return_value=False)
+
+        names = ["99999999999999999999.log", "2147483648.log", "0.log"]
+
+        self.assertEqual(orphan_log_names(names, is_alive), [])
+        is_alive.assert_not_called()
+
+    def test_acepta_el_pid_maximo(self):
+        self.assertEqual(orphan_log_names(["2147483647.log"], lambda pid: False), ["2147483647.log"])
+
+    def test_acepta_el_pid_minimo_y_rechaza_signos(self):
+        names = ["1.log", "-1.log", "+1.log"]
+
+        self.assertEqual(orphan_log_names(names, lambda pid: False), ["1.log"])
+
 
 class ParsePidsTest(unittest.TestCase):
     def test_lee_un_pid_por_linea_e_ignora_lo_demas(self):
@@ -498,16 +632,30 @@ class IsProcessAliveTest(unittest.TestCase):
 
 
 class RemoveOrphanLogsTest(unittest.TestCase):
-    def test_tolera_que_otro_proceso_borre_el_log_antes(self):
+    def test_tolera_que_el_log_no_se_pueda_borrar(self):
+        for error in (FileNotFoundError, PermissionError):
+            with self.subTest(error=error.__name__):
+                log_dir = tempfile.mkdtemp()
+                self.addCleanup(os.rmdir, log_dir)
+                with mock.patch.object(localapps, "LOG_DIR", log_dir), \
+                        mock.patch("localapps.os.listdir", return_value=["111.log"]), \
+                        mock.patch("localapps.is_process_alive", return_value=False), \
+                        mock.patch("localapps.os.unlink", side_effect=error) as unlink:
+                    remove_orphan_logs()
+
+                unlink.assert_called_once_with(os.path.join(log_dir, "111.log"))
+
+    def test_deja_un_directorio_con_nombre_de_log_huerfano(self):
         log_dir = tempfile.mkdtemp()
         self.addCleanup(os.rmdir, log_dir)
+        directory = os.path.join(log_dir, "123.log")
+        os.mkdir(directory)
+        self.addCleanup(os.rmdir, directory)
         with mock.patch.object(localapps, "LOG_DIR", log_dir), \
-                mock.patch("localapps.os.listdir", return_value=["111.log"]), \
-                mock.patch("localapps.is_process_alive", return_value=False), \
-                mock.patch("localapps.os.unlink", side_effect=FileNotFoundError) as unlink:
+                mock.patch("localapps.is_process_alive", return_value=False):
             remove_orphan_logs()
 
-        unlink.assert_called_once_with(os.path.join(log_dir, "111.log"))
+        self.assertTrue(os.path.isdir(directory))
 
 
 class ProcessStartTimeTest(unittest.TestCase):

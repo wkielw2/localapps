@@ -2,14 +2,16 @@
 # Desinstala localapps: quita el enlace de ~/.local/bin (o LOCALAPPS_BIN_DIR) y el workflow de Warp, solo si son los que instaló este repo.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BIN_DIR="${LOCALAPPS_BIN_DIR:-$HOME/.local/bin}"
 TARGET="$REPO_DIR/localapps.py"
 LINK="$BIN_DIR/localapps"
 WARP_WORKFLOW="$HOME/.warp/workflows/localapps.yaml"
 
 # Solo se borra lo que instaló este repo: el enlace a su script y su workflow idéntico.
-if [[ -L "$LINK" && "$(readlink "$LINK")" == "$TARGET" ]]; then
+# Se compara con -ef (mismo dispositivo e inodo) y no por texto: el repo puede alcanzarse
+# por rutas con enlaces simbólicos. Un enlace roto da falso y no se toca.
+if [[ -L "$LINK" && "$LINK" -ef "$TARGET" ]]; then
   rm "$LINK"
   echo "✓ Eliminado $LINK"
 elif [[ -e "$LINK" || -L "$LINK" ]]; then
